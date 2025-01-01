@@ -1,0 +1,376 @@
+---
+title: "CPA_Experiment"
+author: "Eliza MacLean"
+output: html_document
+date: "2024-01-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#library(parallel)
+#library(doParallel)
+#cores <- 4
+#options('mc.cores'=cores)
+#registerDoParallel(cores)
+```
+
+```{r import_traces}
+cipher_file <- file("CPA_Dataset/CPAdataset/EMwavedata10000/CIPHERTEXT10000.txt", open="r")
+ciphertext <- readLines(cipher_file)
+traces_1 <- read.csv("CPA_Dataset/CPAdataset/EMwavedata10000/aes_tv_0000001-0005000_power.csv", header=FALSE)
+traces_2 <- read.csv("CPA_Dataset/CPAdataset/EMwavedata10000/aes_tv_0005001-0010000_power.csv", header=FALSE)
+traces <- rbind(traces_1, traces_2)
+TRACES <- 10000
+```
+
+```{r import_noisy_traces}
+cipher_file <- file("CPA_Dataset/CPAdataset/EMwavedata30000/CIPHERTEXT30000.txt", open="r")
+ciphertext <- readLines(cipher_file)
+traces_1 <- read.csv("CPA_Dataset/CPAdataset/EMwavedata30000/aes_tv_0000001-0005000_power.csv", header=FALSE)
+traces_2 <- read.csv("CPA_Dataset/CPAdataset/EMwavedata30000/aes_tv_0005001-0010000_power.csv", header=FALSE)
+traces_3 <- read.csv("CPA_Dataset/CPAdataset/EMwavedata30000/aes_tv_0010001-0015000_power.csv", header=FALSE)
+traces_4 <- read.csv("CPA_Dataset/CPAdataset/EMwavedata30000/aes_tv_0015001-0020000_power.csv", header=FALSE)
+traces_5 <- read.csv("CPA_Dataset/CPAdataset/EMwavedata30000/aes_tv_0020001-0025000_power.csv", header=FALSE)
+traces_6 <- read.csv("CPA_Dataset/CPAdataset/EMwavedata30000/aes_tv_0025001-0030000_power.csv", header=FALSE)
+traces <- rbind(traces_1, traces_2, traces_3, traces_4, traces_5, traces_6)
+TRACES <- 30000
+```
+
+```{r cuda_hyp}
+hyp_gen_cu <- function (byte, cipher, ntraces, wnd) {
+  if(!is.loaded("hyp_gen")) {
+    dyn.load("/home/eliza/school/homma_lab/hyp_gen.so")
+  }
+  bc <- (byte+(4*(byte %% 4))) %% 16 #correct for shift_rows aes step
+  nv <- strtoi(substring(cipher, bc*2 + 3, bc*2 + 4), 16L) # the current value of the byte corresponding to the current one in the state
+  ov <- strtoi(substring(cipher, byte*2 + 3, byte*2 + 4), 16L) # the value with the last round key added, but must be compared to the corresponding shifted value
+  H <- matrix(0,nrow = ntraces, ncol = 256)
+  t(matrix(.C("hyp_gen",
+            as.integer(ntraces),
+            as.integer(nv),
+            as.integer(ov),
+            as.integer(wnd),
+            as.integer(H)
+  )[[5]],nrow=256, ncol=ntraces))
+}
+```
+
+```{r cuda_corr}
+corr_cu <- function (H, tr) {
+  if(!is.loaded("pcorr")) {
+    dyn.load("/home/eliza/school/homma_lab/pcorr.so")
+  }
+  trm <- t(data.matrix(unname(tr)))
+  R <- matrix(0, ncol= ncol(tr), nrow = 256)
+  rst <- .C("pcorr",
+     as.integer(t(H)),
+     as.double(trm),
+     as.integer(nrow(H)),
+     as.integer(ncol(tr)),
+     as.double(R))
+  t(matrix(rst[[5]], ncol = 256, nrow = ncol(tr)))
+}
+```
+
+```{r lp_cu}
+low_pass_cu <- function (tr, alpha) {
+  if(!is.loaded("low_pass")) {
+    dyn.load("/home/eliza/school/homma_lab/low_pass.so")
+  }
+  trm <- t(data.matrix(unname(tr)))
+  lpt <- matrix(0, ncol = ncol(tr), nrow = nrow(tr))
+  rst <- .C("low_pass",
+            as.double(trm),
+            as.double(alpha),
+            as.integer(nrow(tr)),
+            as.integer(ncol(tr)),
+            as.double(lpt))
+  t(matrix(rst[[5]], ncol = nrow(tr), nrow = ncol(tr)))
+}
+```
+
+```{r guess_byte}
+guess_byte <- function(byte, tr, cipher, ntraces) {
+  H <- hyp_gen_cu(byte, cipher, ntraces, 0)
+  R <- corr_cu(H, tr)
+  Rc <- abs(R)
+  which(Rc == max(Rc), arr.ind = TRUE, useNames=FALSE)[1,1] - 1
+}
+```
+
+```{r trim}
+trimmed <- traces[,c(2000:2300)]
+trimlp <- low_pass_cu(trimmed, 0.95)
+```
+
+```{r guess_10r_seq}
+key <- integer(16)
+for(i in 0:15) {
+  key[i+1] = guess_byte(i, traces, ciphertext, TRACES)
+}
+key
+```
+```{r lp_plots}
+par(mar=c(1,1,1,1))
+plot(c(1:300), trimmed[1,c(1:300)], type="l", col = "lightblue", xlab = "Sample", ylab = "", lwd =2, yaxt = 'n',main = "Power Trace", xaxt = 'n', xaxs="i", yaxs="i")
+lines(c(1:300), trimlp[1,c(1:300)], type="l", col = "red", lwd=3)
+legend("bottomright", legend=c("Raw", "Filtered"), lwd=c(2,3), col=c("lightblue","red"))
+title(ylab = "Voltage", line = 0, cex.lab = 1.2, family = "Calibri Light")
+title(xlab = "Sample", line = 00, cex.lab = 1.2, family = "Calibri Light")
+```
+```{r corr_plot}
+H <- hyp_gen_cu(0, ciphertext, TRACES, 0)
+  R <- corr_cu(H, trimlp)
+  Rc <- abs(R)
+  k <- which(Rc == max(Rc), arr.ind = TRUE, useNames=FALSE)[1,1] - 1
+par(mar=c(1.3,3.5,1.3,1))
+plot(c(1:300), R[k+1,c(1:300)], type="l", col = "purple", xlab = "", ylab = "", lwd =3,main = "Hypothetical-Real Voltage Correlation", xaxs="i", yaxs="i", xaxt="n")
+
+
+for(i in c(1:256)) {
+  lines(c(1:300), R[i,c(1:300)], type="l", col = "grey", lwd=0.5)
+}
+
+lines(c(1:300), R[k+1,c(1:300)], type="l", col = "purple",lwd =3)
+
+legend("bottomright", legend=c("Correct Guess", "Incorrect Guesses"), lwd=c(3,0.5), col=c("purple","grey"))
+title(ylab = "Correlation", line = 2, cex.lab = 1.2, family = "Calibri Light")
+title(xlab = "Sample Time", line = 0.1, cex.lab = 1.2, family = "Calibri Light")
+```
+
+# AGING STUFF
+
+```{r process_raw}
+raw_trace <- function(path, ntraces, npoints) {
+  raw <- readBin(path, "raw", ntraces * npoints)
+  t(matrix(as.numeric(raw), ncol=ntraces, nrow=npoints))[,-(npoints)]
+}
+```
+
+```{r import_aging_0}
+atrs0 <- list()
+atrs0[[1]] <- raw_trace("/home/eliza/school/homma_lab/aging_trace_data/aging_wave_data_44a-0day_240501.bin", 1000, 64623)[c(1:1000),c(57500:62500)]
+atrs0[[2]] <- raw_trace("/home/eliza/school/homma_lab/aging_trace_data/aging_wave_data_45a-0day_240501.bin", 1000, 64623)[c(1:1000),c(57500:62500)]
+atrs0[[3]] <- raw_trace("/home/eliza/school/homma_lab/aging_trace_data/aging_wave_data_46a-0day_240501.bin", 1000, 64623)[c(1:1000),c(57500:62500)]
+atrs0[[4]] <- raw_trace("/home/eliza/school/homma_lab/aging_trace_data/aging_wave_data_47a-0day_240501.bin", 1000, 64623)[c(1:1000),c(57500:62500)]
+atrs0[[5]] <- raw_trace("/home/eliza/school/homma_lab/aging_trace_data/aging_wave_data_48a-0day_240501.bin", 1000, 64623)[c(1:1000),c(57500:62500)]
+atrs0[[6]] <- raw_trace("/home/eliza/school/homma_lab/aging_trace_data/aging_wave_data_49a-0day_240501.bin", 1000, 64623)[c(1:1000),c(57500:62500)]
+atrs0[[7]] <- raw_trace("/home/eliza/school/homma_lab/aging_trace_data/aging_wave_data_50a-0day_240501.bin", 1000, 64623)[c(1:1000),c(57500:62500)]
+atraces <- 1000
+#atr <- rbind(tr_1, tr_2, tr_3, tr_4, tr_5, tr_6, tr_7)
+```
+
+```{r impoart_aging_4}
+atrs4 <- list()
+atrs4[[1]] <- raw_trace("/home/eliza/school/homma_lab/aging_trace_data/aging_wave_data_34a-4.5day_240501.bin", 1000, 64623)[c(1:1000),c(57500:62500)]
+atrs4[[2]] <- raw_trace("/home/eliza/school/homma_lab/aging_trace_data/aging_wave_data_38a-4.5day_240501.bin", 1000, 64623)[c(1:1000),c(57500:62500)]
+atrs4[[3]] <- raw_trace("/home/eliza/school/homma_lab/aging_trace_data/aging_wave_data_39a-4.5day_240501.bin", 1000, 64623)[c(1:1000),c(57500:62500)]
+atrs4[[4]] <- raw_trace("/home/eliza/school/homma_lab/aging_trace_data/aging_wave_data_40a-4.5day_240501.bin", 1000, 64623)[c(1:1000),c(57500:62500)]
+atrs4[[5]] <- raw_trace("/home/eliza/school/homma_lab/aging_trace_data/aging_wave_data_41a-4.5day_240501.bin", 1000, 64623)[c(1:1000),c(57500:62500)]
+atrs4[[6]] <- raw_trace("/home/eliza/school/homma_lab/aging_trace_data/aging_wave_data_42a-4.5day_240501.bin", 1000, 64623)[c(1:1000),c(57500:62500)]
+atrs4[[7]] <- raw_trace("/home/eliza/school/homma_lab/aging_trace_data/aging_wave_data_43a-4.5day_240501.bin", 1000, 64623)[c(1:1000),c(57500:62500)]
+atraces <- 1000
+#atr <- rbind(tr_1, tr_2, tr_3, tr_4, tr_5, tr_6, tr_7)
+```
+
+```{r aging_ciphers}
+age_file <- file("aging_trace_data/CIPHERTEXTAGING.txt", open="r")
+aging_ciphers <- readLines(age_file)
+```
+
+```{r lp_atr}
+lp_atr <- low_pass_cu(atr, 0.95)
+```
+
+```{r aging_hyp}
+H <- hyp_gen_cu(7,aging_ciphers,1000,1)
+
+R <- corr_cu(H, tr_1)
+
+Rc <- abs(R)
+k <- which(Rc == max(Rc), arr.ind = TRUE, useNames=FALSE)[1,1] - 1
+  
+plot(x=c(1:ncol(R)), y=R[k + 1,c(1:ncol(R))], type="l", xlab = "t", ylab = "corr", main=as.hexmode(k))  
+```
+
+```{r lp_aging}
+lp_tr_1 <- low_pass_cu(tr_1, 0.99)
+```
+
+```{r guess_aging}
+guess_aging <- function(byte, tr, cipher, ntraces) {
+  H <- hyp_gen_cu(byte, cipher, ntraces, 1)
+  R <- corr_cu(H, tr)
+  Rc <- abs(R)
+  which(Rc == max(Rc), arr.ind = TRUE, useNames=FALSE)[1,1] - 1
+}
+
+max_corr <- function(byte, tr, cipher, ntraces) {
+  H <- hyp_gen_cu(byte, cipher, ntraces, 1)
+  R <- corr_cu(H, tr)
+  Rc <- abs(R)
+  max(Rc)
+}
+```
+
+```{r}
+key <- integer(16)
+for(i in 0:15) {
+  key[i+1] = guess_aging(i, atrs4[[1]], aging_ciphers, atraces)
+}
+key
+```
+
+```{r guess_10r_seq_aging}
+corrs0 <- c()
+for (tr in atrs0) {
+  for(i in 0:15) {
+    corrs0 <- append(corrs0, max_corr(i, tr, aging_ciphers, atraces))
+  }
+}
+mean(corrs0)
+sd(corrs0)
+```
+```{r}
+corrs4 <- c()
+for (tr in atrs4) {
+  for(i in 0:15) {
+    corrs4 <- append(corrs4, max_corr(i, tr, aging_ciphers, atraces))
+  }
+}
+mean(corrs4)
+sd(corrs4)
+```
+```{r histo}
+hist(corrs0, breaks = 10, col=rgb(0,0,1,1/4), ylim = c(0,26), main = "Maximum Correlation in aging Cohorts", xlab="Max Corr")
+hist(corrs4, breaks = 10, add = TRUE, col=rgb(1,0,0,1/4))
+legend("topright", legend = c("0 Day", "4.5 Day"), fill = c(rgb(0,0,1,1/4), rgb(1,0,0,1/4)), cex=0.8)
+```
+```{r aging_t_test}
+t.test(corrs0, corrs4)
+```
+
+```{r plot2}
+plot(x=c(1:64622), y=R[242,c(1:64622)], type="l", xlab = "t", ylab = "v", main="241 (incorrect)")
+```
+
+```{r reload}
+dyn.unload("/home/eliza/school/homma_lab/pcorr.so")
+dyn.unload("/home/eliza/school/homma_lab/hyp_gen.so")
+dyn.unload("/home/eliza/school/homma_lab/low_pass.so")
+```
+<!---
+```{r sbox}
+isbox <- function(x) {
+  inverse_sbox <- c(0x52,0x09,0x6A,0xD5,0x30,0x36,0xA5,0x38,0xBF,0x40,0xA3,0x9E,0x81,0xF3,0xD7,0xFB,
+0x7C,0xE3,0x39,0x82,0x9B,0x2F,0xFF,0x87,0x34,0x8E,0x43,0x44,0xC4,0xDE,0xE9,0xCB,
+0x54,0x7B,0x94,0x32,0xA6,0xC2,0x23,0x3D,0xEE,0x4C,0x95,0x0B,0x42,0xFA,0xC3,0x4E,
+0x08,0x2E,0xA1,0x66,0x28,0xD9,0x24,0xB2,0x76,0x5B,0xA2,0x49,0x6D,0x8B,0xD1,0x25,
+0x72,0xF8,0xF6,0x64,0x86,0x68,0x98,0x16,0xD4,0xA4,0x5C,0xCC,0x5D,0x65,0xB6,0x92,
+0x6C,0x70,0x48,0x50,0xFD,0xED,0xB9,0xDA,0x5E,0x15,0x46,0x57,0xA7,0x8D,0x9D,0x84,
+0x90,0xD8,0xAB,0x00,0x8C,0xBC,0xD3,0x0A,0xF7,0xE4,0x58,0x05,0xB8,0xB3,0x45,0x06,
+0xD0,0x2C,0x1E,0x8F,0xCA,0x3F,0x0F,0x02,0xC1,0xAF,0xBD,0x03,0x01,0x13,0x8A,0x6B,
+0x3A,0x91,0x11,0x41,0x4F,0x67,0xDC,0xEA,0x97,0xF2,0xCF,0xCE,0xF0,0xB4,0xE6,0x73,
+0x96,0xAC,0x74,0x22,0xE7,0xAD,0x35,0x85,0xE2,0xF9,0x37,0xE8,0x1C,0x75,0xDF,0x6E,
+0x47,0xF1,0x1A,0x71,0x1D,0x29,0xC5,0x89,0x6F,0xB7,0x62,0x0E,0xAA,0x18,0xBE,0x1B,
+0xFC,0x56,0x3E,0x4B,0xC6,0xD2,0x79,0x20,0x9A,0xDB,0xC0,0xFE,0x78,0xCD,0x5A,0xF4,
+0x1F,0xDD,0xA8,0x33,0x88,0x07,0xC7,0x31,0xB1,0x12,0x10,0x59,0x27,0x80,0xEC,0x5F,
+0x60,0x51,0x7F,0xA9,0x19,0xB5,0x4A,0x0D,0x2D,0xE5,0x7A,0x9F,0x93,0xC9,0x9C,0xEF,
+0xA0,0xE0,0x3B,0x4D,0xAE,0x2A,0xF5,0xB0,0xC8,0xEB,0xBB,0x3C,0x83,0x53,0x99,0x61,
+0x17,0x2B,0x04,0x7E,0xBA,0x77,0xD6,0x26,0xE1,0x69,0x14,0x63,0x55,0x21,0x0C,0x7D)
+  inverse_sbox[x+1]
+}
+```
+
+```{r hamming_distance}
+hd <- function(x,y) {
+  sum(as.logical(xor(intToBits(x),intToBits(y))))
+}
+
+kisb <- function(x,y) {
+  isbox(bitwXor(x,y))
+}
+```
+
+```{r generate_hypothetical_power}
+gen_h <- function(byte) {
+  bc <- (byte+(4*(byte %% 4))) %% 16 #correct for shift_rows aes step
+  nv <- strtoi(substring(ciphertext, bc*2 + 3, bc*2 + 4), 16L) # the current value of the byte corresponding to the current one in the state
+  ov <- strtoi(substring(ciphertext, byte*2 + 3, byte*2 + 4), 16L) # the value with the last round key added, but must be compared to the corresponding shifted value
+  H <- matrix(,nrow = TRACES, ncol = 256)
+  for(j in 0:255) {
+    for(i in 1:TRACES) {
+      H[i,j+1] <- hd(kisb(ov[i],j), nv[i])   
+    }
+  }
+  H
+}
+```
+
+
+
+```{r guess_1}
+H <- gen_h(0)
+R <- cor(H[,c(1:256)],traces[c(1:TRACES),])
+which(R == max(R), arr.ind = TRUE, useNames=FALSE)[1,1] - 1
+```
+```{r guess_10r_key_parallel}
+system.time(key <- foreach(i = c(0:15)) %dopar% {
+  H <- gen_h(i)
+  R <- cor(H[,c(1:256)],traces[c(1:TRACES),])
+  which(R == max(R), arr.ind = TRUE, useNames=FALSE)[1,1]
+})
+unlist(key, use.names=FALSE) - 1
+```
+
+
+```{r guess_10r_key}
+#R <- cor(H[,c(1:256)],traces)
+key <- integer(16)
+for (i in 0:15) {
+  H <- gen_h(i)
+  R <- cor(H[,c(1:256)],traces[c(1:10000),])
+  key[i+1] <- which(R == max(R), arr.ind = TRUE, useNames=FALSE)[1,1]
+}
+keyr10 <- key - 1
+keyr10
+```
+
+
+
+<!---
+```{r}
+H <- gen_h(7)
+R <- cor(H[,c(1:256)],traces)
+cors <- matrix(,nrow = 100, ncol = 256)
+ckb <- which(R == max(R), arr.ind = TRUE, useNames=FALSE)[1,1]
+for (i in c(1:256)) {
+  cors[100, i] = max(R[i,])
+}
+
+for (i in seq(0, 10000, 100)) {
+  R <- cor(H[,c(1:256)],traces[c(1:i)])
+  for (j in c(1:256)) {
+    cors[i/100, j] = max(R[j,])
+  }
+}
+```
+-->
+
+<!---
+```{r}
+H <- gen_h(3)
+R <- cor(H[,c(1:256)],traces)
+which(R == max(R), arr.ind = TRUE, useNames=FALSE)
+```
+-->
+
+<!---
+```{r}
+#par(mfrow = c(16,16))
+for(i in 207:209) {
+  plot(x=c(1:3840),y=R[i+1,], xlab="time", ylab="correlation", main = paste("Key Hypo.:", i), ylim = c(-0.15,0.1))  
+}
+```
+-->
+
